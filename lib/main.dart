@@ -6,6 +6,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_background_service_android/flutter_background_service_android.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -16,6 +17,11 @@ import 'data/database_helper.dart';
 import 'features/auth/login_screen.dart';
 import 'features/auth/signup_screen.dart';
 import 'features/dashboard/main_dashboard.dart';
+
+// ── Notification channel constants ───────────────
+const String _notifChannelId = 'my_foreground';
+const String _notifChannelName = 'Auto Attendance Service';
+const int _notifId = 888;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -32,6 +38,11 @@ Future<void> main() async {
 
   await DatabaseHelper.instance.database;
 
+  // ── CRITICAL: Create notification channel BEFORE service starts ──
+  // This fixes CannotPostForegroundServiceNotificationException on
+  // Android 13+ and MIUI 14
+  await _createNotificationChannel();
+
   await _checkPermissions();
   await initializeService();
 
@@ -46,10 +57,47 @@ Future<void> main() async {
   );
 }
 
+// ── Create notification channel before service starts ────
+Future<void> _createNotificationChannel() async {
+  final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+      FlutterLocalNotificationsPlugin();
+
+  // Initialize the plugin first
+  const AndroidInitializationSettings androidSettings =
+      AndroidInitializationSettings('@mipmap/ic_launcher');
+  const InitializationSettings initSettings =
+      InitializationSettings(android: androidSettings);
+  await flutterLocalNotificationsPlugin.initialize(initSettings);
+
+  // Create the channel with HIGH importance so Android accepts it
+  // for foreground services
+  const AndroidNotificationChannel channel = AndroidNotificationChannel(
+    _notifChannelId,
+    _notifChannelName,
+    description: 'Used for auto attendance background tracking',
+    importance: Importance.high, // Must be high or max for foreground service
+    enableVibration: false,
+    playSound: false,
+  );
+
+  await flutterLocalNotificationsPlugin
+      .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(channel);
+
+  debugPrint('Notification channel created: $_notifChannelId');
+}
+
 Future<void> _checkPermissions() async {
   await Permission.location.request();
   await Permission.locationAlways.request();
   await Permission.notification.request();
+
+  // MIUI FIX: Request battery optimization exemption
+  final batteryStatus = await Permission.ignoreBatteryOptimizations.status;
+  if (!batteryStatus.isGranted) {
+    await Permission.ignoreBatteryOptimizations.request();
+  }
 }
 
 Future<void> initializeService() async {
@@ -60,10 +108,10 @@ Future<void> initializeService() async {
       onStart: onStart,
       autoStart: true,
       isForegroundMode: true,
-      notificationChannelId: 'my_foreground',
+      notificationChannelId: _notifChannelId, // Must match channel above
       initialNotificationTitle: 'Auto Attendance Active',
       initialNotificationContent: 'Monitoring college geofence...',
-      foregroundServiceNotificationId: 888,
+      foregroundServiceNotificationId: _notifId,
       autoStartOnBoot: true,
       foregroundServiceTypes: [AndroidForegroundType.location],
     ),
@@ -103,7 +151,54 @@ void onStart(ServiceInstance service) async {
     try {
       final now = DateTime.now();
 
-      if (now.hour >= 7 && now.hour < 18 && now.weekday < 6) {
+      // ── Auto punch-out at 7:30pm ─────────────────
+      if (now.hour == 19 && now.minute >= 30 && now.minute < 35) {
+        final date =
+            "${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}";
+        final existing =
+            await DatabaseHelper.instance.getAttendanceByDate(date);
+
+        if (existing != null && existing['is_active'] == 1) {
+          final punchOutTime = DateTime(now.year, now.month, now.day, 19, 30);
+          final punchInDt = DateTime.parse(existing['punch_in']);
+          final duration = punchOutTime.difference(punchInDt).inMinutes;
+
+          String attendanceType;
+          int graceUsed = 0;
+
+          if (duration < 180) {
+            attendanceType = 'ABSENT';
+          } else {
+            final shortfall = 420 - duration;
+            if (shortfall <= 0) {
+              attendanceType = 'FULL';
+            } else if (shortfall <= 60) {
+              attendanceType = 'FULL';
+              graceUsed = shortfall;
+            } else {
+              attendanceType = 'HALF';
+            }
+          }
+
+          await DatabaseHelper.instance.updatePunchOut(
+            attendanceId: existing['id'],
+            punchOutTime: punchOutTime.toString().substring(0, 19),
+            durationMinutes: duration,
+            usedGraceMinutes: graceUsed,
+            attendanceType: attendanceType,
+          );
+
+          if (service is AndroidServiceInstance) {
+            service.setForegroundNotificationInfo(
+              title: "Auto Punch-Out ✓",
+              content: "Punched out at 7:30 PM — $attendanceType",
+            );
+          }
+        }
+      }
+
+      // ── Geofence check (working hours only) ──────
+      if (now.hour >= 7 && now.hour < 16 && now.weekday < 6) {
         Position position = await Geolocator.getCurrentPosition(
             desiredAccuracy: LocationAccuracy.high,
             timeLimit: const Duration(seconds: 15));
@@ -117,16 +212,19 @@ void onStart(ServiceInstance service) async {
           final existing =
               await DatabaseHelper.instance.getAttendanceByDate(date);
 
+          // Only auto punch-in if no record yet AND before 4pm
           if (existing == null) {
             await DatabaseHelper.instance.insertPunchIn(
-                date: date,
-                punchInTime: now.toString().substring(0, 19),
-                punchType: "AUTO");
+              date: date,
+              punchInTime: now.toString().substring(0, 19),
+              punchType: "AUTO",
+            );
 
             if (service is AndroidServiceInstance) {
               service.setForegroundNotificationInfo(
-                title: "Attendance Marked!",
-                content: "Auto-punched in at ${now.hour}:${now.minute}",
+                title: "Attendance Marked ✓",
+                content:
+                    "Auto-punched in at ${now.hour}:${now.minute.toString().padLeft(2, '0')}",
               );
             }
           }
@@ -138,6 +236,7 @@ void onStart(ServiceInstance service) async {
             );
           }
         }
+
         service.invoke(
             'update', {"current_distance": distance.toStringAsFixed(1)});
       }

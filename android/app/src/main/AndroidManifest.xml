@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- MIUI FIX: Prevents battery optimizer from killing the background service -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <uses-feature android:name="android.hardware.location.gps" />
 
@@ -47,11 +49,12 @@
             android:exported="false"
             android:foregroundServiceType="location" />
 
-        <!-- FIX: flutter_background_service plugin service for Android 14+ (targetSDK 34+) -->
+        <!-- FIX: flutter_background_service - stopWithTask=false keeps service alive after swipe -->
         <service
             android:name="id.flutter.flutter_background_service.BackgroundService"
             android:foregroundServiceType="location"
-            tools:replace="android:foregroundServiceType" />
+            android:stopWithTask="false"
+            tools:replace="android:foregroundServiceType,android:stopWithTask" />
 
         <!-- Geofence Receiver -->
         <receiver
