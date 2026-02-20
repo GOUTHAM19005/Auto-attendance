@@ -7,7 +7,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_background_service_android/flutter_background_service_android.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 // Internal Imports
 import 'core/theme/theme_controller.dart';
@@ -20,7 +20,6 @@ import 'features/dashboard/main_dashboard.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // 🔹 FIREBASE INITIALIZATION
   await Firebase.initializeApp(
     options: const FirebaseOptions(
       apiKey: "AIzaSyCm57xgXyvRLHTwY5cfDwp_DrwhljUKCno",
@@ -31,10 +30,9 @@ Future<void> main() async {
     ),
   );
 
-  // 🔹 LOCAL DATABASE INITIALIZATION
   await DatabaseHelper.instance.database;
 
-  // 🔹 BACKGROUND SERVICE INITIALIZATION
+  await _checkPermissions();
   await initializeService();
 
   runApp(
@@ -46,6 +44,12 @@ Future<void> main() async {
       child: const MyApp(),
     ),
   );
+}
+
+Future<void> _checkPermissions() async {
+  await Permission.location.request();
+  await Permission.locationAlways.request();
+  await Permission.notification.request();
 }
 
 Future<void> initializeService() async {
@@ -60,6 +64,8 @@ Future<void> initializeService() async {
       initialNotificationTitle: 'Auto Attendance Active',
       initialNotificationContent: 'Monitoring college geofence...',
       foregroundServiceNotificationId: 888,
+      autoStartOnBoot: true,
+      foregroundServiceTypes: [AndroidForegroundType.location],
     ),
     iosConfiguration: IosConfiguration(
       autoStart: true,
@@ -74,56 +80,69 @@ void onStart(ServiceInstance service) async {
   DartPluginRegistrant.ensureInitialized();
 
   if (service is AndroidServiceInstance) {
-    service
-        .on('setAsForeground')
-        .listen((event) => service.setAsForegroundService());
-    service
-        .on('setAsBackground')
-        .listen((event) => service.setAsBackgroundService());
+    service.setAsForegroundService();
+    service.setForegroundNotificationInfo(
+      title: "Auto Attendance Active",
+      content: "Monitoring college geofence...",
+    );
+
+    service.on('setAsForeground').listen((event) {
+      service.setAsForegroundService();
+    });
+
+    service.on('setAsBackground').listen((event) {
+      service.setAsBackgroundService();
+    });
   }
 
-  service.on('stopService').listen((event) => service.stopSelf());
+  service.on('stopService').listen((event) {
+    service.stopSelf();
+  });
 
   Timer.periodic(const Duration(minutes: 5), (timer) async {
-    final now = DateTime.now();
-    bool isWorkHour = now.hour >= 7 && now.hour < 18;
-    bool isWeekday = now.weekday < 6;
+    try {
+      final now = DateTime.now();
 
-    if (isWorkHour && isWeekday) {
-      try {
+      if (now.hour >= 7 && now.hour < 18 && now.weekday < 6) {
         Position position = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.high);
-
-        double collegeLat = 9.41285;
-        double collegeLon = 76.64225;
+            desiredAccuracy: LocationAccuracy.high,
+            timeLimit: const Duration(seconds: 15));
 
         double distance = Geolocator.distanceBetween(
-            position.latitude, position.longitude, collegeLat, collegeLon);
+            position.latitude, position.longitude, 9.359433, 76.646917);
 
         if (distance <= 100) {
           final date =
               "${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}";
-          final time = now.toString().substring(0, 19);
-
           final existing =
               await DatabaseHelper.instance.getAttendanceByDate(date);
+
           if (existing == null) {
             await DatabaseHelper.instance.insertPunchIn(
-                date: date, punchInTime: time, punchType: "AUTO");
+                date: date,
+                punchInTime: now.toString().substring(0, 19),
+                punchType: "AUTO");
 
             if (service is AndroidServiceInstance) {
               service.setForegroundNotificationInfo(
                 title: "Attendance Marked!",
-                content: "Auto-punched in at $time",
+                content: "Auto-punched in at ${now.hour}:${now.minute}",
               );
             }
+          }
+        } else {
+          if (service is AndroidServiceInstance) {
+            service.setForegroundNotificationInfo(
+              title: "Auto Attendance Active",
+              content: "Distance: ${distance.toStringAsFixed(0)}m from college",
+            );
           }
         }
         service.invoke(
             'update', {"current_distance": distance.toStringAsFixed(1)});
-      } catch (e) {
-        debugPrint("Background Error: $e");
       }
+    } catch (e) {
+      debugPrint("Service Error: $e");
     }
   });
 }
@@ -131,71 +150,32 @@ void onStart(ServiceInstance service) async {
 @pragma('vm:entry-point')
 Future<bool> onIosBackground(ServiceInstance service) async => true;
 
-// --- MAIN APP ---
-
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
-
-  Future<bool> _isProfileComplete() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString('user_name') != null;
-  }
 
   @override
   Widget build(BuildContext context) {
     return Consumer<ThemeController>(
-      builder: (context, themeController, child) {
-        return MaterialApp(
-          debugShowCheckedModeBanner: false,
-          title: 'Auto Attendance',
-          theme: ThemeData(
-            useMaterial3: true,
-            colorScheme:
-                ColorScheme.fromSeed(seedColor: const Color(0xFF4F46E5)),
-          ),
-          darkTheme: ThemeData.dark(useMaterial3: true),
-          themeMode: themeController.themeMode,
-          routes: {
-            '/signup': (context) => const SignupScreen(),
-            '/login': (context) => const LoginScreen(),
-            '/dashboard': (context) => const MainDashboard(),
+        builder: (context, themeController, child) {
+      return MaterialApp(
+        debugShowCheckedModeBanner: false,
+        themeMode: themeController.themeMode,
+        theme: ThemeData(
+            useMaterial3: true, colorSchemeSeed: const Color(0xFF4F46E5)),
+        darkTheme: ThemeData.dark(useMaterial3: true),
+        routes: {
+          '/signup': (context) => const SignupScreen(),
+          '/login': (context) => const LoginScreen(),
+          '/dashboard': (context) => const MainDashboard(),
+        },
+        home: StreamBuilder<User?>(
+          stream: FirebaseAuth.instance.authStateChanges(),
+          builder: (context, snapshot) {
+            if (snapshot.hasData) return const MainDashboard();
+            return const LoginScreen();
           },
-          home: StreamBuilder<User?>(
-            stream: FirebaseAuth.instance.authStateChanges(),
-            builder: (context, snapshot) {
-              if (snapshot.connectionState == ConnectionState.waiting) {
-                return const Scaffold(
-                    body: Center(child: CircularProgressIndicator()));
-              }
-
-              // 🔹 AUTH GATE: If user is logged in
-              if (snapshot.hasData) {
-                return FutureBuilder<bool>(
-                  future: _isProfileComplete(),
-                  builder: (context, profileSnapshot) {
-                    if (profileSnapshot.connectionState ==
-                        ConnectionState.waiting) {
-                      return const Scaffold(
-                          body: Center(child: CircularProgressIndicator()));
-                    }
-
-                    // Once logged in, initialize the service and go to Dashboard
-                    WidgetsBinding.instance.addPostFrameCallback((_) {
-                      Provider.of<AttendanceService>(context, listen: false)
-                          .initializeUser();
-                    });
-
-                    return const MainDashboard();
-                  },
-                );
-              }
-
-              // 🔹 No Firebase session: Show Login
-              return const LoginScreen();
-            },
-          ),
-        );
-      },
-    );
+        ),
+      );
+    });
   }
 }

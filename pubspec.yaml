@@ -22,6 +22,9 @@ dependencies:
   # BACKGROUND & AUTOMATION
   # ===============================
   flutter_background_service: ^5.1.0 
+  flutter_background_service_android: ^6.1.0
+  # 🔹 REQUIRED FIX: For creating notification channels in Android 13+
+  flutter_local_notifications: ^17.2.2 
   
   # ===============================
   # LOCATION & PERMISSIONS
@@ -45,7 +48,7 @@ dependencies:
   # ===============================
   sqflite: ^2.3.3+1
   path: ^1.9.0
-  shared_preferences: ^2.2.2 # Added for local profile storage
+  shared_preferences: ^2.2.2 
 
   # ===============================
   # DATE & TIME FORMATTING

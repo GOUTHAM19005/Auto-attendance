@@ -34,8 +34,8 @@ class _MainDashboardState extends State<MainDashboard> {
   void initState() {
     super.initState();
     _geofenceService = GeofenceService(
-      centerLat: 9.41285,
-      centerLng: 76.64225,
+      centerLat: 9.359433,
+      centerLng: 76.646917,
       radiusInMeters: 100,
     );
 
