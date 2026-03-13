@@ -21,7 +21,6 @@ class SettingsScreen extends StatelessWidget {
         elevation: 0,
       ),
       body: StreamBuilder<DocumentSnapshot>(
-        // This still fetches user profile info from Firebase
         stream: FirebaseFirestore.instance
             .collection('users')
             .doc(user?.uid)
@@ -30,16 +29,37 @@ class SettingsScreen extends StatelessWidget {
           String name = "Faculty Member";
           String dept = "Department";
 
+          // Default shift times
+          TimeOfDay shiftIn = const TimeOfDay(hour: 9, minute: 0);
+          TimeOfDay shiftOut = const TimeOfDay(hour: 16, minute: 0);
+
           if (snapshot.hasData && snapshot.data!.exists) {
             var data = snapshot.data!.data() as Map<String, dynamic>;
             name = data['name'] ?? name;
             dept = data['department'] ?? dept;
+
+            // Load saved shift times if available
+            if (data['shift_in'] != null) {
+              final parts = (data['shift_in'] as String).split(':');
+              shiftIn = TimeOfDay(
+                  hour: int.parse(parts[0]), minute: int.parse(parts[1]));
+            }
+            if (data['shift_out'] != null) {
+              final parts = (data['shift_out'] as String).split(':');
+              shiftOut = TimeOfDay(
+                  hour: int.parse(parts[0]), minute: int.parse(parts[1]));
+            }
           }
 
           return ListView(
             padding: const EdgeInsets.symmetric(vertical: 10),
             children: [
               _profileSection(name, dept),
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 16),
+                child: Divider(),
+              ),
+              _shiftSection(context, user?.uid, shiftIn, shiftOut),
               const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 16),
                 child: Divider(),
@@ -89,6 +109,105 @@ class SettingsScreen extends StatelessWidget {
     );
   }
 
+  // ── Shift Timings Section ─────────────────────────────────────────────────
+  Widget _shiftSection(BuildContext context, String? uid, TimeOfDay shiftIn,
+      TimeOfDay shiftOut) {
+    String _fmt(TimeOfDay t) {
+      final h = t.hourOfPeriod == 0 ? 12 : t.hourOfPeriod;
+      final m = t.minute.toString().padLeft(2, '0');
+      final period = t.period == DayPeriod.am ? 'AM' : 'PM';
+      return '$h:$m $period';
+    }
+
+    return ExpansionTile(
+      leading: const Icon(Icons.access_time, color: Colors.indigo),
+      title: const Text("Shift Timings"),
+      subtitle: Text(
+        '${_fmt(shiftIn)} → ${_fmt(shiftOut)}',
+        style: const TextStyle(fontSize: 12, color: Colors.grey),
+      ),
+      children: [
+        // Punch In Time
+        ListTile(
+          leading: const Icon(Icons.login, color: Colors.green),
+          title: const Text('Punch In Time'),
+          subtitle: Text(
+            _fmt(shiftIn),
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+          ),
+          trailing: const Icon(Icons.edit, size: 18, color: Colors.grey),
+          onTap: () async {
+            final picked = await showTimePicker(
+              context: context,
+              initialTime: shiftIn,
+              helpText: 'Select Shift Start Time',
+            );
+            if (picked != null && uid != null) {
+              await FirebaseFirestore.instance
+                  .collection('users')
+                  .doc(uid)
+                  .update({
+                'shift_in':
+                    '${picked.hour}:${picked.minute.toString().padLeft(2, '0')}',
+              });
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Punch In time updated to ${_fmt(picked)}'),
+                  backgroundColor: Colors.green,
+                ),
+              );
+            }
+          },
+        ),
+
+        // Punch Out Time
+        ListTile(
+          leading: const Icon(Icons.logout, color: Colors.redAccent),
+          title: const Text('Punch Out Time'),
+          subtitle: Text(
+            _fmt(shiftOut),
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+          ),
+          trailing: const Icon(Icons.edit, size: 18, color: Colors.grey),
+          onTap: () async {
+            final picked = await showTimePicker(
+              context: context,
+              initialTime: shiftOut,
+              helpText: 'Select Shift End Time',
+            );
+            if (picked != null && uid != null) {
+              await FirebaseFirestore.instance
+                  .collection('users')
+                  .doc(uid)
+                  .update({
+                'shift_out':
+                    '${picked.hour}:${picked.minute.toString().padLeft(2, '0')}',
+              });
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Punch Out time updated to ${_fmt(picked)}'),
+                  backgroundColor: Colors.indigo,
+                ),
+              );
+            }
+          },
+        ),
+
+        // Info note
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+          child: Text(
+            'ℹ️ Grace time is calculated based on your shift end time. '
+            'Full day requires ${_fmtMins()} mins of work.',
+            style: const TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _fmtMins() => '420'; // 7 hours
+
   Widget _themeSection(ThemeController controller) {
     return ExpansionTile(
       leading: const Icon(Icons.palette, color: Colors.indigo),
@@ -117,7 +236,6 @@ class SettingsScreen extends StatelessWidget {
       subtitle: const Text('Offline PDF Export'),
       trailing: const Icon(Icons.download, color: Colors.grey),
       onTap: () async {
-        // Show a loading snackbar
         final messenger = ScaffoldMessenger.of(context);
         messenger.showSnackBar(
           const SnackBar(
@@ -127,7 +245,6 @@ class SettingsScreen extends StatelessWidget {
         );
 
         try {
-          // Calls your updated SQLite-based helper
           await PdfExportService.generateAttendancePdf();
         } catch (e) {
           messenger.hideCurrentSnackBar();

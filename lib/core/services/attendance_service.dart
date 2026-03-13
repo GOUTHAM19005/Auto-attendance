@@ -1,49 +1,58 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../data/database_helper.dart';
 
 class AttendanceService extends ChangeNotifier {
   final DatabaseHelper _db = DatabaseHelper.instance;
 
-  // ── Shift constants ──────────────────────────
-  //  Full Day  : punch in ≤ 9:00am, punch out ≥ 4:00pm (7hrs / 420 mins)
-  //  Half Day  : covers 9am–12pm (morning) OR 1pm–4pm (afternoon)
-  //  Absent    : worked < 3 hours (180 mins)
-  //  Leave     : punch in AT or AFTER 4:00pm
-  //  Grace     : shortfall from 420 mins, MAX 60 mins/day
-  //              deducted from monthly pool (250 mins total)
-  //  Auto-out  : 7:30pm if still punched in
+  // ── Shift times (loaded from Firestore, fallback to defaults) ────────────
+  int _shiftStartH = 9;
+  int _shiftStartM = 0;
+  int _shiftEndH = 16;
+  int _shiftEndM = 0;
 
-  static const int _shiftStartH = 9; // 9:00 AM
-  static const int _shiftStartM = 0;
-  static const int _shiftEndH = 16; // 4:00 PM
-  static const int _shiftEndM = 0;
-  static const int _afternoonStartH = 13; // 1:00 PM
+  // ── Auto punch-out = shift end + 30 min buffer ───────────────────────────
+  static const int _autoPunchOutBufferMins = 30;
+
+  // ── Fixed constants ──────────────────────────────────────────────────────
+  static const int _afternoonStartH = 13;
   static const int _afternoonStartM = 0;
-  static const int _autoPunchOutH = 19; // 7:30 PM
-  static const int _autoPunchOutM = 30;
 
-  static const int _fullDayMins = 420; // 7 hours
-  static const int _halfDayMins = 180; // 3 hours
-  static const int _maxDailyGrace = 60; // 60 mins/day cap
+  static const int _fullDayMins = 420;
+  static const int _halfDayMins = 180;
+  static const int _maxDailyGrace = 60;
   static const int _monthlyGraceLimit = 250;
 
-  // ── State ────────────────────────────────────
+  // ── State ────────────────────────────────────────────────────────────────
   DateTime? punchIn;
   DateTime? finalPunchOut;
   bool _isPunchedIn = false;
   bool isInside = false;
   String? _dayType;
   int _graceMinutes = 0;
+  int _dynamicFullDayMins = _fullDayMins;
 
   List<Map<String, dynamic>> _history = [];
   int _monthlyGraceTotal = 0;
 
-  // ── Getters ──────────────────────────────────
+  // ── Getters ──────────────────────────────────────────────────────────────
   bool get isPunchedIn => _isPunchedIn;
   String? get dayType => _dayType;
   int get graceMinutes => _graceMinutes;
   List<Map<String, dynamic>> get history => _history;
   int get monthlyGraceTotal => _monthlyGraceTotal;
+  int get monthlyGraceRemaining =>
+      (_monthlyGraceLimit - _monthlyGraceTotal).clamp(0, _monthlyGraceLimit);
+
+  TimeOfDay get shiftStart =>
+      TimeOfDay(hour: _shiftStartH, minute: _shiftStartM);
+  TimeOfDay get shiftEnd => TimeOfDay(hour: _shiftEndH, minute: _shiftEndM);
+
+  TimeOfDay get autoPunchOutTime {
+    final totalMins = _shiftEndH * 60 + _shiftEndM + _autoPunchOutBufferMins;
+    return TimeOfDay(hour: (totalMins ~/ 60) % 24, minute: totalMins % 60);
+  }
 
   // ─────────────────────────────────────────────
   //  INIT
@@ -51,6 +60,8 @@ class AttendanceService extends ChangeNotifier {
 
   Future<void> initializeUser() async {
     try {
+      await _loadShiftTimesFromFirestore();
+      await _refreshMonthlyGraceTotal();
       await loadTodayAttendance();
       await fetchHistory();
       debugPrint('AttendanceService: initialized.');
@@ -60,6 +71,64 @@ class AttendanceService extends ChangeNotifier {
       rethrow;
     }
   }
+
+  // ─────────────────────────────────────────────
+  //  LOAD SHIFT TIMES FROM FIRESTORE
+  // ─────────────────────────────────────────────
+
+  Future<void> _loadShiftTimesFromFirestore() async {
+    try {
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      if (uid == null) return;
+
+      final doc = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(uid)
+          .get();
+
+      if (!doc.exists || doc.data() == null) return;
+      final data = doc.data()!;
+
+      if (data['shift_in'] != null) {
+        final parts = (data['shift_in'] as String).split(':');
+        _shiftStartH = int.parse(parts[0]);
+        _shiftStartM = int.parse(parts[1]);
+      }
+
+      if (data['shift_out'] != null) {
+        final parts = (data['shift_out'] as String).split(':');
+        _shiftEndH = int.parse(parts[0]);
+        _shiftEndM = int.parse(parts[1]);
+      }
+
+      final shiftMins = (_shiftEndH * 60 + _shiftEndM) -
+          (_shiftStartH * 60 + _shiftStartM);
+      _dynamicFullDayMins = shiftMins > 0 ? shiftMins : _fullDayMins;
+
+      debugPrint('AttendanceService: Shift → '
+          '$_shiftStartH:${_shiftStartM.toString().padLeft(2, '0')} → '
+          '$_shiftEndH:${_shiftEndM.toString().padLeft(2, '0')} '
+          '($_dynamicFullDayMins mins)');
+    } catch (e) {
+      debugPrint('AttendanceService: Could not load shift times. Using defaults.');
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  //  GRACE TOTAL
+  // ─────────────────────────────────────────────
+
+  Future<void> _refreshMonthlyGraceTotal() async {
+    final now = DateTime.now();
+    final monthKey = '${now.year}-${now.month.toString().padLeft(2, '0')}';
+    _monthlyGraceTotal = await _db.getMonthlyGraceTotal(monthKey);
+    debugPrint(
+        'AttendanceService: Monthly grace → $_monthlyGraceTotal / $_monthlyGraceLimit');
+  }
+
+  // ─────────────────────────────────────────────
+  //  LOAD TODAY & HISTORY
+  // ─────────────────────────────────────────────
 
   Future<void> loadTodayAttendance() async {
     final now = DateTime.now();
@@ -84,9 +153,7 @@ class AttendanceService extends ChangeNotifier {
 
   Future<void> fetchHistory() async {
     _history = await _db.getAllAttendance();
-    final now = DateTime.now();
-    final monthKey = '${now.year}-${now.month.toString().padLeft(2, '0')}';
-    _monthlyGraceTotal = await _db.getMonthlyGraceTotal(monthKey);
+    await _refreshMonthlyGraceTotal();
     notifyListeners();
   }
 
@@ -97,6 +164,8 @@ class AttendanceService extends ChangeNotifier {
   Future<void> handlePunch(
       {required String punchType, DateTime? customDateTime}) async {
     final time = customDateTime ?? DateTime.now();
+    await _loadShiftTimesFromFirestore();
+    await _refreshMonthlyGraceTotal();
     await _handlePunch(time, punchType);
     await fetchHistory();
   }
@@ -111,13 +180,13 @@ class AttendanceService extends ChangeNotifier {
     final row = await _db.getAttendanceByDate(date);
 
     if (!_isPunchedIn) {
-      // ── PUNCH IN ─────────────────────────────
+      // ── PUNCH IN ──────────────────────────────────────────────────────────
       final shiftEnd =
           DateTime(time.year, time.month, time.day, _shiftEndH, _shiftEndM);
 
-      // If punching in at or after 4:00pm → mark as LEAVE immediately
+      // Punch in at or after shift end → LEAVE
       if (!time.isBefore(shiftEnd)) {
-        debugPrint('AttendanceService: Punch-in at/after 4pm → LEAVE');
+        debugPrint('AttendanceService: Punch-in at/after shift end → LEAVE');
         int id;
         if (row == null) {
           id = await _db.insertPunchIn(
@@ -144,22 +213,31 @@ class AttendanceService extends ChangeNotifier {
         return;
       }
 
-      // Normal punch in
       if (row == null) {
+        // ── No record yet → fresh punch in ──────────────────────────────────
         await _db.insertPunchIn(
           date: date,
           punchInTime: dateTimeStr,
           punchType: punchType,
         );
         punchIn = time;
+        debugPrint('AttendanceService: Fresh punch in at $dateTimeStr');
       } else {
-        await _db.updateAttendanceStatus(row['id'], 1);
-        punchIn = DateTime.parse(row['punch_in']);
+        // ── Record exists (completed earlier) → RE-PUNCH IN ─────────────────
+        // Reactivate the existing row, keeping the ORIGINAL punch_in time.
+        // Clears punch_out / attendance_type so the day stays open
+        // until the final punch out.
+        await _db.reactivatePunchIn(row['id']);
+        punchIn = DateTime.parse(row['punch_in']); // keep original time
+        debugPrint('AttendanceService: Re-punch in → '
+            'original punch_in kept as ${row['punch_in']}');
       }
+
       _isPunchedIn = true;
       _scheduleAutoPunchOut(time);
     } else {
-      // ── PUNCH OUT ────────────────────────────
+      // ── PUNCH OUT ─────────────────────────────────────────────────────────
+      // Always calculate from the ORIGINAL punch_in stored in DB
       final firstIn = DateTime.parse(row!['punch_in']);
       final result = _calculateAttendance(firstIn, time);
 
@@ -176,6 +254,9 @@ class AttendanceService extends ChangeNotifier {
       finalPunchOut = time;
       _dayType = result.type;
       _graceMinutes = result.graceUsed;
+
+      debugPrint('AttendanceService: Punch out at $dateTimeStr → '
+          '${result.type}, grace=${result.graceUsed}');
     }
     notifyListeners();
   }
@@ -194,6 +275,9 @@ class AttendanceService extends ChangeNotifier {
         selectedDate.day, inTime.hour, inTime.minute);
     final fullOut = DateTime(selectedDate.year, selectedDate.month,
         selectedDate.day, outTime.hour, outTime.minute);
+
+    await _loadShiftTimesFromFirestore();
+    await _refreshMonthlyGraceTotal();
 
     final result = _calculateAttendance(fullIn, fullOut);
 
@@ -215,23 +299,32 @@ class AttendanceService extends ChangeNotifier {
   }
 
   // ─────────────────────────────────────────────
-  //  AUTO PUNCH-OUT AT 7:30 PM
+  //  AUTO PUNCH-OUT (shift end + 30 min buffer)
   // ─────────────────────────────────────────────
 
   void _scheduleAutoPunchOut(DateTime fromTime) {
+    final totalMins =
+        _shiftEndH * 60 + _shiftEndM + _autoPunchOutBufferMins;
+    final autoH = (totalMins ~/ 60) % 24;
+    final autoM = totalMins % 60;
+
     final autoPunchOut = DateTime(
       fromTime.year,
       fromTime.month,
       fromTime.day,
-      _autoPunchOutH,
-      _autoPunchOutM,
+      autoH,
+      autoM,
     );
+
     final now = DateTime.now();
     final delay = autoPunchOut.difference(now);
 
+    debugPrint('AttendanceService: Auto punch-out at '
+        '$autoH:${autoM.toString().padLeft(2, '0')}');
+
     if (delay.isNegative) {
       if (_isPunchedIn) {
-        debugPrint('AttendanceService: Past 7:30pm on load → auto punch-out.');
+        debugPrint('AttendanceService: Already past auto punch-out → punching out now.');
         handlePunch(punchType: 'auto', customDateTime: autoPunchOut);
       }
       return;
@@ -239,7 +332,7 @@ class AttendanceService extends ChangeNotifier {
 
     Future.delayed(delay, () {
       if (_isPunchedIn) {
-        debugPrint('AttendanceService: 7:30pm hit → auto punch-out.');
+        debugPrint('AttendanceService: Auto punch-out triggered.');
         handlePunch(punchType: 'auto', customDateTime: autoPunchOut);
       }
     });
@@ -248,24 +341,6 @@ class AttendanceService extends ChangeNotifier {
   // ─────────────────────────────────────────────
   //  ATTENDANCE CALCULATION ENGINE
   // ─────────────────────────────────────────────
-  //
-  //  Step 0: punch-in ≥ 4:00pm              → LEAVE  (no grace)
-  //  Step 1: duration < 3hrs (180 min)      → ABSENT (no grace)
-  //  Step 2: late > 60 mins (after 10:00am) → HALF   (no grace)
-  //  Step 3: shortfall = 420 - duration
-  //    • shortfall ≤ 0            → FULL  (worked 7hrs+, no grace needed)
-  //    • shortfall ≤ 60 AND pool ≥ shortfall → FULL (grace deducted)
-  //    • otherwise                → HALF  (no grace)
-  //
-  //  Examples:
-  //    9:00am–4:00pm = 420 min → shortfall 0   → FULL, 0 grace
-  //    9:30am–4:00pm = 390 min → shortfall 30  → FULL, 30 grace
-  //    9:00am–3:30pm = 390 min → shortfall 30  → FULL, 30 grace
-  //    9:30am–3:30pm = 360 min → shortfall 60  → FULL, 60 grace
-  //    9:30am–3:00pm = 330 min → shortfall 90  → HALF (>60 cap)
-  //    10:10am–4:00pm → late 70 min > 60 cap   → HALF (no grace)
-  //    4:34pm–10:11pm → punch-in after 4pm     → LEAVE
-  //
 
   _AttendanceResult _calculateAttendance(DateTime inT, DateTime outT) {
     final shiftStart =
@@ -277,46 +352,40 @@ class AttendanceService extends ChangeNotifier {
 
     final durationMins = outT.difference(inT).inMinutes;
 
-    // ── Step 0: Punch-in at or after 4:00pm → LEAVE ──
+    // Step 0: punch-in at or after shift end → LEAVE
     if (!inT.isBefore(shiftEnd)) {
       return const _AttendanceResult(type: 'LEAVE', graceUsed: 0);
     }
 
-    // ── Step 1: Less than 3 hours → ABSENT ──────────
+    // Step 1: worked less than 3 hours → ABSENT
     if (durationMins < _halfDayMins) {
       return const _AttendanceResult(type: 'ABSENT', graceUsed: 0);
     }
 
-    // ── Step 2: Late by more than 60 mins → HALF ────
+    // Step 2: arrived more than 60 mins late → HALF
     final lateMins =
         inT.isAfter(shiftStart) ? inT.difference(shiftStart).inMinutes : 0;
     if (lateMins > _maxDailyGrace) {
-      // If punched in before 1pm, they covered at least the afternoon session
       final type = inT.isBefore(afternoonSt) ? 'HALF' : 'ABSENT';
       return _AttendanceResult(type: type, graceUsed: 0);
     }
 
-    // ── Step 3: Grace shortfall check ───────────────
-    final shortfall = _fullDayMins - durationMins;
+    // Step 3: grace shortfall
+    final shortfall = _dynamicFullDayMins - durationMins;
 
-    // Worked 7 hours or more — full day, no grace needed
     if (shortfall <= 0) {
       return const _AttendanceResult(type: 'FULL', graceUsed: 0);
     }
 
-    // Shortfall within 60-min daily grace cap
     if (shortfall <= _maxDailyGrace) {
       final graceAvailable = _monthlyGraceLimit - _monthlyGraceTotal;
       if (graceAvailable >= shortfall) {
-        // Pool has enough — mark FULL and deduct shortfall
-        _monthlyGraceTotal += shortfall; // optimistic local update
+        _monthlyGraceTotal += shortfall;
         return _AttendanceResult(type: 'FULL', graceUsed: shortfall);
       }
-      // Pool exhausted — can't cover → HALF
       return const _AttendanceResult(type: 'HALF', graceUsed: 0);
     }
 
-    // Shortfall > 60 mins — too big for grace → HALF
     return const _AttendanceResult(type: 'HALF', graceUsed: 0);
   }
 
@@ -336,11 +405,11 @@ class AttendanceService extends ChangeNotifier {
       '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 }
 
-// ── Result model ─────────────────────────────────
+// ── Result model ──────────────────────────────────────────────────────────────
 
 class _AttendanceResult {
-  final String type; // 'FULL' | 'HALF' | 'ABSENT' | 'LEAVE'
-  final int graceUsed; // actual minutes deducted from monthly pool
+  final String type;
+  final int graceUsed;
 
   const _AttendanceResult({required this.type, required this.graceUsed});
 }

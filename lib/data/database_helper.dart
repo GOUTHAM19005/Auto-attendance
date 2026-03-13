@@ -36,8 +36,7 @@ class DatabaseHelper {
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
     if (oldVersion < 2) {
-      await db
-          .execute("ALTER TABLE attendance ADD COLUMN attendance_type TEXT");
+      await db.execute("ALTER TABLE attendance ADD COLUMN attendance_type TEXT");
     }
     if (oldVersion < 3) {
       await db.execute(
@@ -99,6 +98,26 @@ class DatabaseHelper {
     });
   }
 
+  /// Reactivates an existing completed record for re-punch-in.
+  /// Clears punch_out, duration, grace and attendance_type so the
+  /// day stays open until the final punch out.
+  /// Always keeps the ORIGINAL punch_in time intact.
+  Future<int> reactivatePunchIn(int id) async {
+    final db = await database;
+    return await db.update(
+      'attendance',
+      {
+        'punch_out': null,
+        'duration_minutes': null,
+        'used_grace_minutes': null,
+        'attendance_type': null,
+        'is_active': 1,
+      },
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
   Future<int> updateAutoPunchOut({
     required String date,
     required String punchOutTime,
@@ -148,7 +167,6 @@ class DatabaseHelper {
     );
   }
 
-  // 🔹 ADDED: Required for line 90 in Service
   Future<int> updateAttendanceStatus(int id, int isActive) async {
     final db = await database;
     return await db.update(
@@ -159,7 +177,6 @@ class DatabaseHelper {
     );
   }
 
-  // 🔹 ADDED: Required for line 131 in Service
   Future<int> insertManualOverride({
     required String date,
     required String punchIn,
