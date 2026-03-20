@@ -18,6 +18,8 @@ import 'features/auth/login_screen.dart';
 import 'features/auth/signup_screen.dart';
 import 'features/dashboard/main_dashboard.dart';
 
+import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
 // ── Notification channel constants ───────────────
 const String _notifChannelId = 'my_foreground';
 const String _notifChannelName = 'Auto Attendance Service';
@@ -25,6 +27,7 @@ const int _notifId = 888;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  WebViewPlatform.instance = AndroidWebViewPlatform();
 
   await Firebase.initializeApp(
     options: const FirebaseOptions(

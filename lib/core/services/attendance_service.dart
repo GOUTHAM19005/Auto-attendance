@@ -2,9 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../data/database_helper.dart';
+import 'dropbox_backup_service.dart';
 
 class AttendanceService extends ChangeNotifier {
   final DatabaseHelper _db = DatabaseHelper.instance;
+  final DropboxBackupService _dropbox = DropboxBackupService();
 
   // ── Shift times (loaded from Firestore, fallback to defaults) ────────────
   int _shiftStartH = 9;
@@ -104,11 +106,6 @@ class AttendanceService extends ChangeNotifier {
       final shiftMins = (_shiftEndH * 60 + _shiftEndM) -
           (_shiftStartH * 60 + _shiftStartM);
       _dynamicFullDayMins = shiftMins > 0 ? shiftMins : _fullDayMins;
-
-      debugPrint('AttendanceService: Shift → '
-          '$_shiftStartH:${_shiftStartM.toString().padLeft(2, '0')} → '
-          '$_shiftEndH:${_shiftEndM.toString().padLeft(2, '0')} '
-          '($_dynamicFullDayMins mins)');
     } catch (e) {
       debugPrint('AttendanceService: Could not load shift times. Using defaults.');
     }
@@ -122,8 +119,6 @@ class AttendanceService extends ChangeNotifier {
     final now = DateTime.now();
     final monthKey = '${now.year}-${now.month.toString().padLeft(2, '0')}';
     _monthlyGraceTotal = await _db.getMonthlyGraceTotal(monthKey);
-    debugPrint(
-        'AttendanceService: Monthly grace → $_monthlyGraceTotal / $_monthlyGraceLimit');
   }
 
   // ─────────────────────────────────────────────
@@ -168,6 +163,21 @@ class AttendanceService extends ChangeNotifier {
     await _refreshMonthlyGraceTotal();
     await _handlePunch(time, punchType);
     await fetchHistory();
+
+    // ── Auto Dropbox upload after punch if enabled ──
+    await _autoUploadToDropbox(time);
+  }
+
+  // ─────────────────────────────────────────────
+  //  DROPBOX AUTO UPLOAD
+  // ─────────────────────────────────────────────
+
+  Future<void> _autoUploadToDropbox(DateTime time) async {
+    try {
+      await _dropbox.autoUpload();
+    } catch (e) {
+      debugPrint('AttendanceService: Dropbox auto-upload error → $e');
+    }
   }
 
   // ─────────────────────────────────────────────
@@ -180,11 +190,10 @@ class AttendanceService extends ChangeNotifier {
     final row = await _db.getAttendanceByDate(date);
 
     if (!_isPunchedIn) {
-      // ── PUNCH IN ──────────────────────────────────────────────────────────
+      // ── PUNCH IN ─────────────────────────────
       final shiftEnd =
           DateTime(time.year, time.month, time.day, _shiftEndH, _shiftEndM);
 
-      // Punch in at or after shift end → LEAVE
       if (!time.isBefore(shiftEnd)) {
         debugPrint('AttendanceService: Punch-in at/after shift end → LEAVE');
         int id;
@@ -214,30 +223,23 @@ class AttendanceService extends ChangeNotifier {
       }
 
       if (row == null) {
-        // ── No record yet → fresh punch in ──────────────────────────────────
         await _db.insertPunchIn(
           date: date,
           punchInTime: dateTimeStr,
           punchType: punchType,
         );
         punchIn = time;
-        debugPrint('AttendanceService: Fresh punch in at $dateTimeStr');
       } else {
-        // ── Record exists (completed earlier) → RE-PUNCH IN ─────────────────
-        // Reactivate the existing row, keeping the ORIGINAL punch_in time.
-        // Clears punch_out / attendance_type so the day stays open
-        // until the final punch out.
+        // Re-punch in — reactivate existing row, keep original punch_in
         await _db.reactivatePunchIn(row['id']);
-        punchIn = DateTime.parse(row['punch_in']); // keep original time
-        debugPrint('AttendanceService: Re-punch in → '
-            'original punch_in kept as ${row['punch_in']}');
+        punchIn = DateTime.parse(row['punch_in']);
+        debugPrint('AttendanceService: Re-punch in, original time kept.');
       }
 
       _isPunchedIn = true;
       _scheduleAutoPunchOut(time);
     } else {
-      // ── PUNCH OUT ─────────────────────────────────────────────────────────
-      // Always calculate from the ORIGINAL punch_in stored in DB
+      // ── PUNCH OUT ────────────────────────────
       final firstIn = DateTime.parse(row!['punch_in']);
       final result = _calculateAttendance(firstIn, time);
 
@@ -255,8 +257,7 @@ class AttendanceService extends ChangeNotifier {
       _dayType = result.type;
       _graceMinutes = result.graceUsed;
 
-      debugPrint('AttendanceService: Punch out at $dateTimeStr → '
-          '${result.type}, grace=${result.graceUsed}');
+      debugPrint('AttendanceService: Punch out → ${result.type}, grace=${result.graceUsed}');
     }
     notifyListeners();
   }
@@ -296,6 +297,9 @@ class AttendanceService extends ChangeNotifier {
         selectedDate.year == today.year) {
       await loadTodayAttendance();
     }
+
+    // Auto upload after manual override too
+    await _autoUploadToDropbox(selectedDate);
   }
 
   // ─────────────────────────────────────────────
@@ -319,12 +323,8 @@ class AttendanceService extends ChangeNotifier {
     final now = DateTime.now();
     final delay = autoPunchOut.difference(now);
 
-    debugPrint('AttendanceService: Auto punch-out at '
-        '$autoH:${autoM.toString().padLeft(2, '0')}');
-
     if (delay.isNegative) {
       if (_isPunchedIn) {
-        debugPrint('AttendanceService: Already past auto punch-out → punching out now.');
         handlePunch(punchType: 'auto', customDateTime: autoPunchOut);
       }
       return;
@@ -332,7 +332,6 @@ class AttendanceService extends ChangeNotifier {
 
     Future.delayed(delay, () {
       if (_isPunchedIn) {
-        debugPrint('AttendanceService: Auto punch-out triggered.');
         handlePunch(punchType: 'auto', customDateTime: autoPunchOut);
       }
     });
@@ -352,17 +351,14 @@ class AttendanceService extends ChangeNotifier {
 
     final durationMins = outT.difference(inT).inMinutes;
 
-    // Step 0: punch-in at or after shift end → LEAVE
     if (!inT.isBefore(shiftEnd)) {
       return const _AttendanceResult(type: 'LEAVE', graceUsed: 0);
     }
 
-    // Step 1: worked less than 3 hours → ABSENT
     if (durationMins < _halfDayMins) {
       return const _AttendanceResult(type: 'ABSENT', graceUsed: 0);
     }
 
-    // Step 2: arrived more than 60 mins late → HALF
     final lateMins =
         inT.isAfter(shiftStart) ? inT.difference(shiftStart).inMinutes : 0;
     if (lateMins > _maxDailyGrace) {
@@ -370,7 +366,6 @@ class AttendanceService extends ChangeNotifier {
       return _AttendanceResult(type: type, graceUsed: 0);
     }
 
-    // Step 3: grace shortfall
     final shortfall = _dynamicFullDayMins - durationMins;
 
     if (shortfall <= 0) {
@@ -405,11 +400,8 @@ class AttendanceService extends ChangeNotifier {
       '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 }
 
-// ── Result model ──────────────────────────────────────────────────────────────
-
 class _AttendanceResult {
   final String type;
   final int graceUsed;
-
   const _AttendanceResult({required this.type, required this.graceUsed});
 }

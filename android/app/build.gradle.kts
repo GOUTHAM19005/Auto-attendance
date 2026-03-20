@@ -22,14 +22,15 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.attendance_app"
-        minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
-        versionCode = flutter.versionCode
-        versionName = flutter.versionName
+        
+    applicationId = "com.example.attendance_app"
+    minSdk = flutter.minSdkVersion
+    targetSdk = flutter.targetSdkVersion
+    versionCode = flutter.versionCode
+    versionName = flutter.versionName
+    multiDexEnabled = true
+    manifestPlaceholders["appAuthRedirectScheme"] = "attendanceapp"  
 
-        // Needed for background services & Play Services
-        multiDexEnabled = true
     }
 
     buildTypes {
