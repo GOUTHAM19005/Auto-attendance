@@ -25,11 +25,8 @@ class _MainDashboardState extends State<MainDashboard>
   late final GeofenceService _geofenceService;
   bool _initialChecked = false;
 
-  // Animation controllers for nav items
   late List<AnimationController> _navControllers;
   late List<Animation<double>> _navScaleAnims;
-
-  // AppBar fade
   late AnimationController _appBarController;
   late Animation<double> _appBarFade;
 
@@ -54,7 +51,6 @@ class _MainDashboardState extends State<MainDashboard>
   void initState() {
     super.initState();
 
-    // Nav item tap animations
     _navControllers = List.generate(
       4,
       (i) => AnimationController(
@@ -68,10 +64,8 @@ class _MainDashboardState extends State<MainDashboard>
             ))
         .toList();
 
-    // Trigger first tab animation
     _navControllers[0].forward();
 
-    // AppBar fade in
     _appBarController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 700),
@@ -82,10 +76,9 @@ class _MainDashboardState extends State<MainDashboard>
     );
     _appBarController.forward();
 
-    // Geofence + tracking
     _geofenceService = GeofenceService(
-      centerLat: 9.412928,
-      centerLng: 76.642188,
+      centerLat: 9.413113,
+      centerLng: 76.64189,
       radiusInMeters: 75,
     );
 
@@ -93,6 +86,7 @@ class _MainDashboardState extends State<MainDashboard>
       final attendanceService = context.read<AttendanceService>();
       try {
         await attendanceService.loadTodayAttendance();
+        await attendanceService.loadShiftTimings();
         _startTracking(attendanceService);
       } catch (e) {
         debugPrint('Init Error: $e');
@@ -112,7 +106,6 @@ class _MainDashboardState extends State<MainDashboard>
   void _onNavTap(int index) {
     if (index == _currentIndex) return;
     HapticFeedback.lightImpact();
-    // Reset old, animate new
     _navControllers[_currentIndex].reverse();
     setState(() => _currentIndex = index);
     _navControllers[index]
@@ -122,31 +115,65 @@ class _MainDashboardState extends State<MainDashboard>
 
   void _startTracking(AttendanceService attendanceService) async {
     final allowed = await _locationService.ensurePermission();
-    if (!allowed) return;
+    if (!allowed) {
+      debugPrint('GeofenceTracking: Location permission denied');
+      return;
+    }
 
-    _locationService.getPositionStream().listen((position) {
-      if (!_initialChecked) {
-        _initialChecked = true;
-        _geofenceService.check(position);
-        if (_geofenceService.isInside && !attendanceService.isPunchedIn) {
-          attendanceService.handlePunch(punchType: 'auto');
-        }
-        return;
-      }
+    debugPrint('GeofenceTracking: Stream started');
 
-      final changed = _geofenceService.check(position);
-      if (!changed) return;
+    _locationService.getPositionStream().listen(
+      (position) {
+        final now = DateTime.now();
 
-      if (_geofenceService.isInside) {
-        if (!attendanceService.isPunchedIn) {
-          attendanceService.handlePunch(punchType: 'auto');
+        // Weekdays only
+        final bool isWeekday = now.weekday >= 1 && now.weekday <= 5;
+        // Punch-in window : 7:00am – 11:00am
+        // Punch-out window: 1:00pm – 8:00pm
+        final bool isPunchInWindow  = now.hour >= 7  && now.hour < 11;
+        final bool isPunchOutWindow = now.hour >= 13 && now.hour < 20;
+        final bool isActiveWindow   = isPunchInWindow || isPunchOutWindow;
+
+        if (!isWeekday || !isActiveWindow) {
+          attendanceService.updateIsInside(false);
+          return;
         }
-      } else {
-        if (attendanceService.isPunchedIn) {
-          attendanceService.handlePunch(punchType: 'auto');
+
+        final changed = _geofenceService.check(position);
+        final inside = _geofenceService.isInside;
+
+        debugPrint(
+            'GeofenceTracking: lat=${position.latitude}, lng=${position.longitude}, inside=$inside, changed=$changed');
+
+        // Always sync UI
+        attendanceService.updateIsInside(inside);
+
+        if (!_initialChecked) {
+          _initialChecked = true;
+          debugPrint('GeofenceTracking: Cold start — inside=$inside');
+          if (inside && !attendanceService.isPunchedIn) {
+            debugPrint('GeofenceTracking: Cold start punch IN');
+            attendanceService.handlePunch(punchType: 'auto');
+          }
+          return;
         }
-      }
-    });
+
+        if (!changed) return;
+
+        if (inside) {
+          debugPrint('GeofenceTracking: Entered campus → punch IN');
+          if (!attendanceService.isPunchedIn) {
+            attendanceService.handlePunch(punchType: 'auto');
+          }
+        } else {
+          debugPrint('GeofenceTracking: Left campus → punch OUT');
+          if (attendanceService.isPunchedIn) {
+            attendanceService.handlePunch(punchType: 'auto');
+          }
+        }
+      },
+      onError: (e) => debugPrint('GeofenceTracking ERROR: $e'),
+    );
   }
 
   @override
@@ -157,7 +184,6 @@ class _MainDashboardState extends State<MainDashboard>
       backgroundColor: const Color(0xFFF0F2FF),
       extendBody: true,
 
-      // ── Animated AppBar ──────────────────────
       appBar: PreferredSize(
         preferredSize: const Size.fromHeight(70),
         child: FadeTransition(
@@ -183,7 +209,6 @@ class _MainDashboardState extends State<MainDashboard>
                     const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                 child: Row(
                   children: [
-                    // Avatar
                     Container(
                       width: 42,
                       height: 42,
@@ -198,7 +223,6 @@ class _MainDashboardState extends State<MainDashboard>
                     ),
                     const SizedBox(width: 12),
 
-                    // Name & department from Firestore
                     Expanded(
                       child: StreamBuilder<DocumentSnapshot>(
                         stream: FirebaseFirestore.instance
@@ -239,7 +263,6 @@ class _MainDashboardState extends State<MainDashboard>
                       ),
                     ),
 
-                    // Status badge
                     Consumer<AttendanceService>(
                       builder: (_, service, __) {
                         final isIn = service.isPunchedIn;
@@ -290,7 +313,6 @@ class _MainDashboardState extends State<MainDashboard>
 
                     const SizedBox(width: 8),
 
-                    // Sign out
                     InkWell(
                       onTap: () async {
                         await FirebaseAuth.instance.signOut();
@@ -326,7 +348,6 @@ class _MainDashboardState extends State<MainDashboard>
         ),
       ),
 
-      // ── Floating bottom nav ──────────────────
       bottomNavigationBar: Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
         child: Container(

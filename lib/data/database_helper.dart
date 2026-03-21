@@ -55,11 +55,11 @@ class DatabaseHelper {
   static const String _createAttendanceTable = '''
     CREATE TABLE attendance (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      date TEXT NOT NULL,
+      date TEXT NOT NULL UNIQUE,
       punch_in TEXT,
       punch_out TEXT,
       duration_minutes INTEGER,
-      used_grace_minutes INTEGER,
+      used_grace_minutes INTEGER DEFAULT 0,
       attendance_type TEXT,
       punch_type TEXT,
       edited INTEGER DEFAULT 0,
@@ -83,65 +83,31 @@ class DatabaseHelper {
     });
   }
 
+  // ── Read user's monthly grace limit from DB ──
+  Future<int> getMonthlyGraceLimit() async {
+    final db = await database;
+    final result = await db.query('user', where: 'id = ?', whereArgs: [1]);
+    if (result.isEmpty) return 250; // fallback
+    return result.first['monthly_grace_limit'] as int;
+  }
+
   Future<int> insertPunchIn({
     required String date,
     required String punchInTime,
     required String punchType,
   }) async {
     final db = await database;
-    return await db.insert('attendance', {
-      'date': date,
-      'punch_in': punchInTime,
-      'punch_type': punchType,
-      'is_active': 1,
-      'edited': punchType == 'manual' ? 1 : 0,
-    });
-  }
-
-  /// Reactivates an existing completed record for re-punch-in.
-  /// Clears punch_out, duration, grace and attendance_type so the
-  /// day stays open until the final punch out.
-  /// Always keeps the ORIGINAL punch_in time intact.
-  Future<int> reactivatePunchIn(int id) async {
-    final db = await database;
-    return await db.update(
+    return await db.insert(
       'attendance',
       {
-        'punch_out': null,
-        'duration_minutes': null,
-        'used_grace_minutes': null,
-        'attendance_type': null,
+        'date': date,
+        'punch_in': punchInTime,
+        'punch_type': punchType,
         'is_active': 1,
+        'edited': punchType == 'manual' ? 1 : 0,
       },
-      where: 'id = ?',
-      whereArgs: [id],
-    );
-  }
-
-  Future<int> updateAutoPunchOut({
-    required String date,
-    required String punchOutTime,
-  }) async {
-    final db = await database;
-    final records =
-        await db.query('attendance', where: 'date = ?', whereArgs: [date]);
-    if (records.isEmpty) return 0;
-
-    final String punchInStr = records.first['punch_in'] as String;
-    DateTime punchIn = DateTime.parse(punchInStr);
-    DateTime punchOut = DateTime.parse(punchOutTime);
-    int duration = punchOut.difference(punchIn).inMinutes;
-
-    return await db.update(
-      'attendance',
-      {
-        'punch_out': punchOutTime,
-        'duration_minutes': duration,
-        'is_active': 0,
-        'attendance_type': duration > 240 ? 'Full Day' : 'Half Day',
-      },
-      where: 'date = ?',
-      whereArgs: [date],
+      // If a record already exists for this date, replace it
+      conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
 
@@ -177,6 +143,7 @@ class DatabaseHelper {
     );
   }
 
+  // Manual override: upsert so re-overriding the same date replaces correctly
   Future<int> insertManualOverride({
     required String date,
     required String punchIn,
@@ -185,16 +152,24 @@ class DatabaseHelper {
     required String type,
   }) async {
     final db = await database;
-    return await db.insert('attendance', {
-      'date': date,
-      'punch_in': punchIn,
-      'punch_out': punchOut,
-      'used_grace_minutes': grace,
-      'attendance_type': type,
-      'is_active': 0,
-      'punch_type': 'manual_override',
-      'edited': 1,
-    });
+    return await db.insert(
+      'attendance',
+      {
+        'date': date,
+        'punch_in': punchIn,
+        'punch_out': punchOut,
+        'duration_minutes': DateTime.parse(punchOut)
+            .difference(DateTime.parse(punchIn))
+            .inMinutes,
+        'used_grace_minutes': grace,
+        'attendance_type': type,
+        'is_active': 0,
+        'punch_type': 'manual_override',
+        'edited': 1,
+      },
+      // Replace the existing row for that date if one exists
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
   }
 
   Future<Map<String, dynamic>?> getAttendanceByDate(String date) async {
@@ -213,6 +188,7 @@ class DatabaseHelper {
     return await db.query('attendance', orderBy: 'date DESC');
   }
 
+  // Sum grace used this month — monthKey format: 'YYYY-MM'
   Future<int> getMonthlyGraceTotal(String yearMonth) async {
     final db = await database;
     final result = await db.rawQuery(
