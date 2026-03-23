@@ -287,8 +287,7 @@ void onStart(ServiceInstance service) async {
           if (service is AndroidServiceInstance) {
             service.setForegroundNotificationInfo(
               title: "Auto Attendance Active",
-              content:
-                  "Outside campus — ${distance.toStringAsFixed(0)}m away",
+              content: "Monitoring campus geofence...",
             );
           }
         }
