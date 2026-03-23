@@ -126,13 +126,9 @@ class _MainDashboardState extends State<MainDashboard>
       (position) {
         final now = DateTime.now();
 
-        // Weekdays only
+        // Weekdays only, 7am–8pm single window
         final bool isWeekday = now.weekday >= 1 && now.weekday <= 5;
-        // Punch-in window : 7:00am – 11:00am
-        // Punch-out window: 1:00pm – 8:00pm
-        final bool isPunchInWindow  = now.hour >= 7  && now.hour < 11;
-        final bool isPunchOutWindow = now.hour >= 13 && now.hour < 20;
-        final bool isActiveWindow   = isPunchInWindow || isPunchOutWindow;
+        final bool isActiveWindow = now.hour >= 7 && now.hour < 20;
 
         if (!isWeekday || !isActiveWindow) {
           attendanceService.updateIsInside(false);

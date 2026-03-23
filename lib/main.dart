@@ -18,16 +18,18 @@ import 'features/auth/login_screen.dart';
 import 'features/auth/signup_screen.dart';
 import 'features/dashboard/main_dashboard.dart';
 
-import 'package:webview_flutter/webview_flutter.dart';
-import 'package:webview_flutter_android/webview_flutter_android.dart';
 // ── Notification channel constants ───────────────
 const String _notifChannelId = 'my_foreground';
 const String _notifChannelName = 'Auto Attendance Service';
 const int _notifId = 888;
 
+// ── Single source of truth for campus location ───
+const double _campusLat = 9.413113;
+const double _campusLng = 76.64189;
+const double _campusRadius = 75.0; // metres
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  WebViewPlatform.instance = AndroidWebViewPlatform();
 
   await Firebase.initializeApp(
     options: const FirebaseOptions(
@@ -41,11 +43,7 @@ Future<void> main() async {
 
   await DatabaseHelper.instance.database;
 
-  // ── CRITICAL: Create notification channel BEFORE service starts ──
-  // This fixes CannotPostForegroundServiceNotificationException on
-  // Android 13+ and MIUI 14
   await _createNotificationChannel();
-
   await _checkPermissions();
   await initializeService();
 
@@ -60,25 +58,21 @@ Future<void> main() async {
   );
 }
 
-// ── Create notification channel before service starts ────
 Future<void> _createNotificationChannel() async {
   final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
       FlutterLocalNotificationsPlugin();
 
-  // Initialize the plugin first
   const AndroidInitializationSettings androidSettings =
       AndroidInitializationSettings('@mipmap/ic_launcher');
   const InitializationSettings initSettings =
       InitializationSettings(android: androidSettings);
   await flutterLocalNotificationsPlugin.initialize(initSettings);
 
-  // Create the channel with HIGH importance so Android accepts it
-  // for foreground services
   const AndroidNotificationChannel channel = AndroidNotificationChannel(
     _notifChannelId,
     _notifChannelName,
     description: 'Used for auto attendance background tracking',
-    importance: Importance.high, // Must be high or max for foreground service
+    importance: Importance.high,
     enableVibration: false,
     playSound: false,
   );
@@ -96,7 +90,6 @@ Future<void> _checkPermissions() async {
   await Permission.locationAlways.request();
   await Permission.notification.request();
 
-  // MIUI FIX: Request battery optimization exemption
   final batteryStatus = await Permission.ignoreBatteryOptimizations.status;
   if (!batteryStatus.isGranted) {
     await Permission.ignoreBatteryOptimizations.request();
@@ -111,9 +104,9 @@ Future<void> initializeService() async {
       onStart: onStart,
       autoStart: true,
       isForegroundMode: true,
-      notificationChannelId: _notifChannelId, // Must match channel above
+      notificationChannelId: _notifChannelId,
       initialNotificationTitle: 'Auto Attendance Active',
-      initialNotificationContent: 'Monitoring college geofence...',
+      initialNotificationContent: 'Monitoring campus geofence...',
       foregroundServiceNotificationId: _notifId,
       autoStartOnBoot: true,
       foregroundServiceTypes: [AndroidForegroundType.location],
@@ -134,13 +127,12 @@ void onStart(ServiceInstance service) async {
     service.setAsForegroundService();
     service.setForegroundNotificationInfo(
       title: "Auto Attendance Active",
-      content: "Monitoring college geofence...",
+      content: "Monitoring campus geofence...",
     );
 
     service.on('setAsForeground').listen((event) {
       service.setAsForegroundService();
     });
-
     service.on('setAsBackground').listen((event) {
       service.setAsBackgroundService();
     });
@@ -153,11 +145,11 @@ void onStart(ServiceInstance service) async {
   Timer.periodic(const Duration(minutes: 5), (timer) async {
     try {
       final now = DateTime.now();
+      final date =
+          "${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}";
 
-      // ── Auto punch-out at 7:30pm ─────────────────
+      // ── Auto punch-out at 7:30 PM ─────────────
       if (now.hour == 19 && now.minute >= 30 && now.minute < 35) {
-        final date =
-            "${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}";
         final existing =
             await DatabaseHelper.instance.getAttendanceByDate(date);
 
@@ -200,53 +192,115 @@ void onStart(ServiceInstance service) async {
         }
       }
 
-      // ── Geofence check (working hours only) ──────
-      if (now.hour >= 7 && now.hour < 16 && now.weekday < 6) {
-        Position position = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.high,
-            timeLimit: const Duration(seconds: 15));
+      // ── Geofence check — weekdays, smart hours only ──────
+      // Punch-in window : 7:00am – 11:00am
+      // Punch-out window: 1:00pm – 8:00pm
+      final bool isWeekday = now.weekday >= 1 && now.weekday <= 5;
+      
+      
+      final bool isActiveWindow = now.hour >= 7 && now.hour < 20;
 
-        double distance = Geolocator.distanceBetween(
-            position.latitude, position.longitude, 9.359433, 76.646917);
+      if (!isWeekday || !isActiveWindow) {
+        debugPrint('BgService: Outside active window — skipping');
+        return;
+      }
 
-        if (distance <= 100) {
-          final date =
-              "${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}";
-          final existing =
-              await DatabaseHelper.instance.getAttendanceByDate(date);
+      // ── GPS position ──────────────────────────
+      final Position position = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high,
+          timeLimit: const Duration(seconds: 15));
 
-          // Only auto punch-in if no record yet AND before 4pm
-          if (existing == null) {
-            await DatabaseHelper.instance.insertPunchIn(
-              date: date,
-              punchInTime: now.toString().substring(0, 19),
-              punchType: "AUTO",
+      final double distance = Geolocator.distanceBetween(
+        position.latitude,
+        position.longitude,
+        _campusLat,
+        _campusLng,
+      );
+
+      final bool insideCampus = distance <= _campusRadius;
+      debugPrint(
+          'BgService: distance=${distance.toStringAsFixed(1)}m inside=$insideCampus');
+
+      if (insideCampus) {
+        // ── Inside campus → punch in if no record ──
+        final existing =
+            await DatabaseHelper.instance.getAttendanceByDate(date);
+
+        if (existing == null) {
+          await DatabaseHelper.instance.insertPunchIn(
+            date: date,
+            punchInTime: now.toString().substring(0, 19),
+            punchType: 'auto',
+          );
+          debugPrint('BgService: Punch IN recorded');
+
+          if (service is AndroidServiceInstance) {
+            service.setForegroundNotificationInfo(
+              title: "Attendance Marked ✓",
+              content:
+                  "Auto-punched in at ${now.hour}:${now.minute.toString().padLeft(2, '0')}",
             );
+          }
+        }
+      } else {
+        // ── Outside campus → punch out if still active ──
+        final existing =
+            await DatabaseHelper.instance.getAttendanceByDate(date);
 
-            if (service is AndroidServiceInstance) {
-              service.setForegroundNotificationInfo(
-                title: "Attendance Marked ✓",
-                content:
-                    "Auto-punched in at ${now.hour}:${now.minute.toString().padLeft(2, '0')}",
-              );
+        if (existing != null && existing['is_active'] == 1) {
+          final punchInDt = DateTime.parse(existing['punch_in']);
+          final duration = now.difference(punchInDt).inMinutes;
+
+          String attendanceType;
+          int graceUsed = 0;
+
+          if (duration < 180) {
+            attendanceType = 'ABSENT';
+          } else {
+            final shortfall = 420 - duration;
+            if (shortfall <= 0) {
+              attendanceType = 'FULL';
+            } else if (shortfall <= 60) {
+              attendanceType = 'FULL';
+              graceUsed = shortfall;
+            } else {
+              attendanceType = 'HALF';
             }
+          }
+
+          await DatabaseHelper.instance.updatePunchOut(
+            attendanceId: existing['id'],
+            punchOutTime: now.toString().substring(0, 19),
+            durationMinutes: duration,
+            usedGraceMinutes: graceUsed,
+            attendanceType: attendanceType,
+          );
+          debugPrint('BgService: Punch OUT recorded — $attendanceType');
+
+          if (service is AndroidServiceInstance) {
+            service.setForegroundNotificationInfo(
+              title: "Punched Out ✓",
+              content: "Left campus — $attendanceType",
+            );
           }
         } else {
           if (service is AndroidServiceInstance) {
             service.setForegroundNotificationInfo(
               title: "Auto Attendance Active",
-              content: "Distance: ${distance.toStringAsFixed(0)}m from college",
+              content:
+                  "Outside campus — ${distance.toStringAsFixed(0)}m away",
             );
           }
         }
-
-        service.invoke(
-            'update', {"current_distance": distance.toStringAsFixed(1)});
       }
+
+      service.invoke(
+          'update', {"current_distance": distance.toStringAsFixed(1)});
+
     } catch (e) {
-      debugPrint("Service Error: $e");
+      debugPrint('BgService error: $e');
     }
-  });
+  }); // end Timer.periodic
 }
 
 @pragma('vm:entry-point')
